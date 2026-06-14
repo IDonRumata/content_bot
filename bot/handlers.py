@@ -69,8 +69,10 @@ def _post_card(post: Post) -> str:
     views = format_number(post.source_views)
     likes = format_number(post.source_likes)
     src_date = post.source_published_at.strftime("%d.%m.%Y") if post.source_published_at else "—"
+    cat = getattr(post, "category", "finance") or "finance"
+    cat_tag = "💸 Финансы" if cat == "finance" else "🧑‍💻 AI/Кодинг"
     return (
-        f"📋 <b>Пост на проверку</b> [ID: {post.id}]\n\n"
+        f"📋 <b>Пост на проверку</b> [ID: {post.id}] · {cat_tag}\n\n"
         f"🎬 <b>Источник:</b> <a href='{esc(post.source_url)}'>{esc(post.source_title[:60])}</a>\n"
         f"👁 {views} просмотров   ❤️ {likes} лайков   📅 {src_date}\n\n"
         f"──────────────────────\n\n"
@@ -99,12 +101,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "<b>Команды:</b>\n\n"
-        "/queue — посты, ожидающие проверки\n"
+        "/queue — посты на проверке (по 8; повтори для следующих)\n"
+        "   • /queue finance — только финансы\n"
+        "   • /queue ai — только AI/кодинг\n"
         "/stats — статистика токенов и публикаций\n"
         "/bloggers — список активных блоггеров\n"
         "/add_blogger — добавить блоггера\n"
         "/remove_blogger — отключить блоггера\n"
-        "/scrape_now — запустить парсинг прямо сейчас\n"
+        "/scrape_now — запустить парсинг (выбор темы кнопками)\n"
         "/help — эта подсказка",
         parse_mode="HTML",
     )
@@ -112,23 +116,53 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── /queue ────────────────────────────────────────────────────────────────────
 
+QUEUE_BATCH = 8  # cards per /queue call — page through a large backlog
+
+
 @editor_or_admin
 async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    posts = await db_manager.get_posts_for_review()
-    if not posts:
+    """
+    Show the next batch of unshown pending posts. Run /queue again for more.
+    Optional filter: /queue finance | /queue ai
+    """
+    total = await db_manager.count_posts_for_review()
+    if total == 0:
         await update.message.reply_text("📭 Очередь на проверку пуста.")
         return
 
-    await update.message.reply_text(f"📬 Постов на проверке: <b>{len(posts)}</b>", parse_mode="HTML")
+    # Optional category filter from argument.
+    category = None
+    if context.args:
+        arg = context.args[0].lower()
+        if arg in ("finance", "fin", "финансы"):
+            category = "finance"
+        elif arg in ("ai", "vibe", "vibecoding", "кодинг"):
+            category = "vibecoding"
 
-    for post in posts[:5]:  # show max 5 at once to avoid flood
+    batch = await db_manager.get_unshown_for_review(QUEUE_BATCH, category=category)
+    if not batch:
+        await update.message.reply_text(
+            f"📬 Всего на проверке: <b>{total}</b>.\n"
+            f"Новых (непоказанных) в этой выборке нет — обработай карточки выше "
+            f"кнопками ✅/❌/✏️.",
+            parse_mode="HTML",
+        )
+        return
+
+    await update.message.reply_text(
+        f"📬 На проверке: <b>{total}</b>. Показываю <b>{len(batch)}</b> "
+        f"(повтори /queue для следующих).",
+        parse_mode="HTML",
+    )
+
+    for post in batch:
         msg = await update.message.reply_text(
             _post_card(post),
             parse_mode="HTML",
             reply_markup=_review_keyboard(post.id),
             disable_web_page_preview=True,
         )
-        # Save message ID so callback can find this post
+        # Mark as shown so the next /queue pulls the following batch.
         await db_manager.update_post_status(
             post.id, PostStatus.PENDING_REVIEW, review_message_id=msg.message_id
         )
@@ -256,18 +290,48 @@ async def cmd_remove_blogger(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @admin_only
 async def cmd_scrape_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("⚙️ Запускаю парсинг вручную…")
-    # Import here to avoid circular imports
+    """Show a theme picker — scrape finance, AI/coding, or everything."""
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💸 Финансы", callback_data="scrape:finance")],
+        [InlineKeyboardButton("🧑‍💻 AI / Кодинг", callback_data="scrape:vibecoding")],
+        [InlineKeyboardButton("🌐 Все темы", callback_data="scrape:all")],
+    ])
+    await update.message.reply_text(
+        "Что парсить прямо сейчас?", reply_markup=kb
+    )
+
+
+@admin_only
+async def callback_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run a manual scrape for the chosen category in the background."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":")[1]
+    category = None if choice == "all" else choice
+    label = {"finance": "💸 Финансы", "vibecoding": "🧑‍💻 AI / Кодинг"}.get(
+        choice, "🌐 Все темы"
+    )
+    await query.edit_message_text(
+        f"⚙️ Запускаю парсинг: {label}…\n"
+        f"Это займёт несколько минут. Пришлю, когда будут новые посты."
+    )
+
     from scheduler.task_scheduler import run_scrape_job
-    try:
-        count = await run_scrape_job()
-        await update.message.reply_text(
-            f"✅ Парсинг завершён. Новых постов на проверке: <b>{count}</b>",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.error("manual_scrape_failed", error=str(e))
-        await update.message.reply_text(f"❌ Ошибка парсинга: {e}")
+
+    async def _run() -> None:
+        try:
+            count = await run_scrape_job(category=category)
+            await query.message.reply_text(
+                f"✅ Парсинг завершён ({label}). Новых постов: <b>{count}</b>\n"
+                f"Открой /queue для просмотра.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error("manual_scrape_failed", error=str(e))
+            await query.message.reply_text(f"❌ Ошибка парсинга: {esc(e)}", parse_mode="HTML")
+
+    # Don't block the callback — scraping takes minutes.
+    context.application.create_task(_run())
 
 
 # ── Callback query handlers (Approve / Reject / Edit) ────────────────────────
@@ -380,6 +444,7 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(callback_approve, pattern=r"^approve:\d+$"))
     app.add_handler(CallbackQueryHandler(callback_reject, pattern=r"^reject:\d+$"))
     app.add_handler(CallbackQueryHandler(callback_edit, pattern=r"^edit:\d+$"))
+    app.add_handler(CallbackQueryHandler(callback_scrape, pattern=r"^scrape:(finance|vibecoding|all)$"))
 
     # Free-text handler for editing posts (must be last)
     app.add_handler(MessageHandler(

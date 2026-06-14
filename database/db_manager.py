@@ -90,9 +90,12 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 # ── Post helpers ─────────────────────────────────────────────────────────────
 
-async def get_active_bloggers() -> list[Blogger]:
+async def get_active_bloggers(category: str | None = None) -> list[Blogger]:
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Blogger).where(Blogger.active == True))
+        stmt = select(Blogger).where(Blogger.active == True)
+        if category:
+            stmt = stmt.where(Blogger.category == category)
+        result = await session.execute(stmt.order_by(Blogger.id))
         return list(result.scalars().all())
 
 
@@ -138,6 +141,33 @@ async def get_posts_for_review() -> list[Post]:
             .where(Post.status == PostStatus.PENDING_REVIEW)
             .order_by(Post.scraped_at)
         )
+        return list(result.scalars().all())
+
+
+async def count_posts_for_review() -> int:
+    from sqlalchemy import func
+    async with AsyncSessionLocal() as session:
+        return await session.scalar(
+            select(func.count(Post.id)).where(Post.status == PostStatus.PENDING_REVIEW)
+        ) or 0
+
+
+async def get_unshown_for_review(limit: int, category: str | None = None) -> list[Post]:
+    """
+    Next batch of pending posts not yet shown as a review card
+    (review_message_id IS NULL). Lets /queue page through a large backlog
+    without re-sending the same cards.
+    """
+    async with AsyncSessionLocal() as session:
+        stmt = (
+            select(Post)
+            .where(Post.status == PostStatus.PENDING_REVIEW)
+            .where(Post.review_message_id.is_(None))
+        )
+        if category:
+            stmt = stmt.where(Post.category == category)
+        stmt = stmt.order_by(Post.scraped_at).limit(limit)
+        result = await session.execute(stmt)
         return list(result.scalars().all())
 
 

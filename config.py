@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     # Skip a candidate if a post with the same topic was created in the last
     # N days (cross-blogger topic de-duplication).
     topic_dedup_days: int = 45
+    # Minimum source content (transcript + description) in characters. Videos
+    # below this are ads/shorts with nothing to rewrite — skip them so the
+    # model never writes a post "from thin air".
+    min_source_chars: int = 220
 
     # ── App ──────────────────────────────────────────────────────────────────
     bot_mode: Literal["polling", "production"] = "polling"

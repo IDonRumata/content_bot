@@ -292,11 +292,13 @@ class YouTubeScraper:
     # ── Factory for Post creation ─────────────────────────────────────────────
 
     async def video_to_post(
-        self, video: VideoMeta, blogger_id: int, category: str = "finance"
+        self, video: VideoMeta, blogger_id: int, category: str = "finance",
+        transcript: str | None = None,
     ) -> Post:
         """Build an unsaved Post object from scraped VideoMeta."""
-        # Fetch transcript only when we actually need it (saves quota & memory)
-        transcript = self.get_transcript(video.video_id)
+        # Reuse a transcript already fetched by the caller; else fetch now.
+        if transcript is None:
+            transcript = self.get_transcript(video.video_id)
         return Post(
             blogger_id=blogger_id,
             category=category,

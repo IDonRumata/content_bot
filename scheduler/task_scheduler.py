@@ -66,27 +66,29 @@ def _get_th_publisher() -> ThreadsPublisher:
 
 # ── Scrape job ─────────────────────────────────────────────────────────────────
 
-async def run_scrape_job() -> int:
+async def run_scrape_job(category: str | None = None) -> int:
     """
-    Scrape all active bloggers, rewrite content, save as PENDING_REVIEW,
-    notify admin about new posts awaiting review.
-    Returns the count of new posts created.
+    Scrape active bloggers, rewrite content, save as PENDING_REVIEW,
+    notify reviewers about new posts.
+
+    `category` — if given ("finance" / "vibecoding"), only scrape bloggers of
+    that domain; None = all. Returns the count of new posts created.
     """
-    logger.info("scrape_job_start")
+    logger.info("scrape_job_start", category=category or "all")
     scraper = _get_scraper()
     processor = _get_processor()
     tg = _get_tg_publisher()
 
-    bloggers = await db_manager.get_active_bloggers()
+    bloggers = await db_manager.get_active_bloggers(category=category)
     if not bloggers:
-        logger.warning("no_active_bloggers")
+        logger.warning("no_active_bloggers", category=category or "all")
         return 0
 
     new_posts: list[Post] = []
     loop = asyncio.get_event_loop()
 
     for blogger in bloggers:
-        category = getattr(blogger, "category", "finance") or "finance"
+        b_category = getattr(blogger, "category", "finance") or "finance"
         try:
             videos = await scraper.scrape_blogger(
                 blogger.channel_id,
@@ -97,7 +99,7 @@ async def run_scrape_job() -> int:
                 # across ALL bloggers, before spending rewrite tokens.
                 topic = await loop.run_in_executor(
                     None, processor.classify_topic,
-                    video.title, video.description, category,
+                    video.title, video.description, b_category,
                 )
                 if topic and await db_manager.topic_exists_recent(
                     topic, _settings.topic_dedup_days
@@ -108,18 +110,36 @@ async def run_scrape_job() -> int:
                     )
                     continue
 
-                post = await scraper.video_to_post(video, blogger.id, category)
+                # Skip "empty" videos (ads / shorts with no transcript & thin
+                # description) — rewriting them produces posts "from thin air".
+                transcript = await loop.run_in_executor(
+                    None, scraper.get_transcript, video.video_id
+                )
+                source_chars = len(transcript) + len(video.description or "")
+                if source_chars < _settings.min_source_chars:
+                    logger.info(
+                        "thin_content_skipped",
+                        blogger=blogger.name, source_id=video.video_id,
+                        source_chars=source_chars,
+                    )
+                    continue
+
+                post = await scraper.video_to_post(
+                    video, blogger.id, b_category, transcript=transcript
+                )
                 post.topic_signature = topic or None
 
                 # Rewrite in a thread pool to avoid blocking the event loop
-                post = await loop.run_in_executor(None, processor.process_post, post)
+                post = await loop.run_in_executor(
+                    None, lambda p=post: processor.process_post(p, blogger.name)
+                )
 
                 saved = await db_manager.save_post(post)
                 new_posts.append(saved)
                 logger.info(
                     "post_saved",
                     post_id=saved.id, source_id=saved.source_id,
-                    category=category, topic=topic,
+                    category=b_category, topic=topic,
                 )
 
         except Exception as e:
@@ -136,8 +156,12 @@ async def run_scrape_job() -> int:
             )
 
     if new_posts:
+        label = {"finance": "💸 Финансы", "vibecoding": "🧑‍💻 AI/Кодинг"}.get(
+            category, "Все темы"
+        )
         await tg.notify_reviewers(
             f"📬 <b>Новые посты на проверке: {len(new_posts)}</b>\n"
+            f"Тема: {label}\n"
             f"Используй /queue для просмотра."
         )
 
