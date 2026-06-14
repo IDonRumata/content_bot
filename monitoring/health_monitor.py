@@ -2,18 +2,16 @@
 Health monitor — runs every 10 minutes and checks:
 
   1. Database connectivity
-  2. YouTube API quota (warns when < 20% remaining)
+  2. Posts stuck in FAILED state
   3. Threads token expiry (warns 7 days before)
-  4. Posts stuck in FAILED state
-  5. Scrape job last run time (alerts if overdue by 2× interval)
-  6. Sentry integration (optional — catches uncaught exceptions globally)
+  4. Sentry integration (optional — catches uncaught exceptions globally)
 
 On any critical issue → sends alert to admin via Telegram.
 """
 from __future__ import annotations
 
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -29,9 +27,6 @@ _settings = get_settings()
 
 
 class HealthMonitor:
-    def __init__(self) -> None:
-        self._last_scrape_alert: datetime | None = None  # cooldown for repeat alerts
-
     # ── Main check ─────────────────────────────────────────────────────────────
 
     async def run_checks(self) -> None:
@@ -39,7 +34,6 @@ class HealthMonitor:
 
         issues += await self._check_database()
         issues += await self._check_failed_posts()
-        issues += await self._check_scrape_overdue()
         issues += await self._check_threads_token()
 
         if issues:
@@ -78,27 +72,6 @@ class HealthMonitor:
 
         if count and count > 0:
             return [f"⚠️ {count} постов в статусе FAILED — проверь /stats"]
-        return []
-
-    async def _check_scrape_overdue(self) -> list[str]:
-        from sqlalchemy import select
-        from database.db_manager import AsyncSessionLocal
-        from database.models import SystemEvent
-
-        async with AsyncSessionLocal() as session:
-            last_event = await session.scalar(
-                select(SystemEvent)
-                .where(SystemEvent.event_type == "scrape_completed")
-                .order_by(SystemEvent.created_at.desc())
-                .limit(1)
-            )
-
-        if last_event is None:
-            return []  # never ran yet — not an error
-
-        overdue_threshold = timedelta(hours=_settings.scrape_interval_hours * 2)
-        if datetime.now(timezone.utc) - last_event.created_at.replace(tzinfo=timezone.utc) > overdue_threshold:
-            return [f"⚠️ Парсинг не запускался более {_settings.scrape_interval_hours * 2} часов"]
         return []
 
     async def _check_threads_token(self) -> list[str]:
