@@ -35,6 +35,17 @@ class Settings(BaseSettings):
     # ── YouTube ──────────────────────────────────────────────────────────────
     youtube_api_key: str = Field(..., min_length=10)
 
+    # ── Transcript proxy ─────────────────────────────────────────────────────
+    # YouTube blocks the timedtext (captions) endpoint from datacenter IPs, so
+    # fetching transcripts from a VPS needs a residential proxy. Webshare is the
+    # provider officially integrated with youtube-transcript-api.
+    # Leave empty → no proxy (transcripts will be unavailable from a blocked IP).
+    webshare_proxy_username: str = Field(default="")
+    webshare_proxy_password: str = Field(default="")
+    # Optional fallback: any generic residential/mobile HTTP proxy URL,
+    # e.g. "http://user:pass@host:port". Used only if Webshare creds are unset.
+    transcript_proxy_url: str = Field(default="")
+
     # ── Threads ──────────────────────────────────────────────────────────────
     threads_user_id: str = Field(default="")
     threads_access_token: str = Field(default="")

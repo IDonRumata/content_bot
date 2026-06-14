@@ -10,6 +10,7 @@ Why YouTube:
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -36,6 +37,45 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 _settings = get_settings()
+
+
+def _build_transcript_api() -> YouTubeTranscriptApi:
+    """
+    Construct a transcript client routed through a residential proxy when
+    configured. YouTube blocks the captions endpoint from datacenter IPs, so a
+    proxy is the only reliable way to fetch transcripts from a VPS.
+
+    Priority: Webshare (official integration) → generic proxy URL → no proxy.
+    Requires youtube-transcript-api >= 1.0 (instance API + proxy_config).
+    """
+    proxy_config = None
+    try:
+        from youtube_transcript_api.proxies import (  # v1.x only
+            GenericProxyConfig,
+            WebshareProxyConfig,
+        )
+
+        if _settings.webshare_proxy_username and _settings.webshare_proxy_password:
+            proxy_config = WebshareProxyConfig(
+                proxy_username=_settings.webshare_proxy_username,
+                proxy_password=_settings.webshare_proxy_password,
+            )
+            logger.info("transcript_proxy_enabled", provider="webshare")
+        elif _settings.transcript_proxy_url:
+            proxy_config = GenericProxyConfig(
+                http_url=_settings.transcript_proxy_url,
+                https_url=_settings.transcript_proxy_url,
+            )
+            logger.info("transcript_proxy_enabled", provider="generic")
+    except ImportError:
+        # Old (<1.0) library without proxy support — fall back to static API.
+        return YouTubeTranscriptApi  # type: ignore[return-value]
+
+    try:
+        return YouTubeTranscriptApi(proxy_config=proxy_config)
+    except TypeError:
+        # Instance API not available on this version — use the static class.
+        return YouTubeTranscriptApi  # type: ignore[return-value]
 
 
 def _is_transient_http_error(exc: BaseException) -> bool:
@@ -102,6 +142,8 @@ class YouTubeScraper:
             developerKey=_settings.youtube_api_key,
             cache_discovery=False,
         )
+        # Transcript client (proxy-aware). Built once and reused.
+        self._tx = _build_transcript_api()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -150,21 +192,42 @@ class YouTubeScraper:
 
     def get_transcript(self, video_id: str) -> str:
         """
-        Fetch video transcript (preferring English, then auto-generated).
+        Fetch video transcript (preferring English, then auto-generated),
+        routed through the configured residential proxy.
         Returns plain text or empty string if unavailable.
         Token-conscious: truncate to 3000 chars to limit downstream costs.
+
+        One soft retry on transient errors (e.g. proxy hiccup); "no transcript"
+        and "captions disabled" are permanent and fail fast.
         """
-        try:
-            transcript_list = YouTubeTranscriptApi.get_transcript(
-                video_id, languages=["en", "en-US", "en-GB"]
-            )
-            text = " ".join(t["text"] for t in transcript_list)
-            return text[:3000]  # ~750 tokens — enough context, not wasteful
-        except (NoTranscriptFound, TranscriptsDisabled):
-            return ""
-        except Exception as e:
-            logger.warning("transcript_fetch_failed", video_id=video_id, error=str(e))
-            return ""
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                if hasattr(self._tx, "fetch"):  # v1.x instance API
+                    fetched = self._tx.fetch(
+                        video_id, languages=["en", "en-US", "en-GB"]
+                    )
+                    text = " ".join(snippet.text for snippet in fetched)
+                else:  # legacy static API (<1.0)
+                    data = self._tx.get_transcript(
+                        video_id, languages=["en", "en-US", "en-GB"]
+                    )
+                    text = " ".join(t["text"] for t in data)
+                return text[:3000]  # ~750 tokens — enough context, not wasteful
+            except (NoTranscriptFound, TranscriptsDisabled):
+                return ""  # permanent — this video simply has no usable captions
+            except Exception as e:  # noqa: BLE001 — transient network/proxy/block
+                last_err = e
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+        # str(e) can be a multi-line YouTube error block — keep the log compact.
+        logger.warning(
+            "transcript_fetch_failed",
+            video_id=video_id,
+            error=str(last_err).splitlines()[0][:160] if last_err else "",
+        )
+        return ""
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
