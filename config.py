@@ -34,6 +34,10 @@ class Settings(BaseSettings):
 
     # ── YouTube ──────────────────────────────────────────────────────────────
     youtube_api_key: str = Field(..., min_length=10)
+    # Per-request timeout for YouTube Data API calls (seconds). Without this the
+    # httplib2 client hangs on a network blip until the OS TCP timeout (~1 min),
+    # so a brief hiccup kills the whole scrape run (see "timed out" spam bug).
+    youtube_timeout_sec: int = 30
 
     # ── Transcript proxy ─────────────────────────────────────────────────────
     # YouTube blocks the timedtext (captions) endpoint from datacenter IPs, so

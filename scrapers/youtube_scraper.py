@@ -10,11 +10,13 @@ Why YouTube:
 """
 from __future__ import annotations
 
+import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httplib2
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from tenacity import (
@@ -78,18 +80,33 @@ def _build_transcript_api() -> YouTubeTranscriptApi:
         return YouTubeTranscriptApi  # type: ignore[return-value]
 
 
-def _is_transient_http_error(exc: BaseException) -> bool:
+# Transient network failures worth retrying. socket.timeout / TimeoutError /
+# ConnectionError all subclass OSError; httplib2 raises HttpLib2Error (e.g.
+# ServerNotFoundError on a DNS blip). These are NOT HttpError, so the old
+# predicate never retried them — a single "timed out" killed the whole run.
+_TRANSIENT_NETWORK_ERRORS = (
+    socket.timeout,
+    TimeoutError,
+    ConnectionError,
+    httplib2.HttpLib2Error,
+)
+
+
+def _is_transient_error(exc: BaseException) -> bool:
     """
-    Retry only on transient YouTube API errors (timeouts, 5xx, rate-limit 429).
-    Permanent 4xx like 403 ``accountDelegationForbidden`` or 404 will never
-    succeed on retry — failing fast avoids three pointless 30s back-offs.
+    Retry on transient YouTube API / network errors (timeouts, 5xx, 429, DNS
+    hiccups, connection resets). Permanent 4xx like 403
+    ``accountDelegationForbidden`` or 404 will never succeed on retry — failing
+    fast avoids three pointless back-offs.
     """
-    if not isinstance(exc, HttpError):
-        return False
-    status = getattr(getattr(exc, "resp", None), "status", None)
-    if status is None:
-        return True  # unknown — give it a chance
-    return status == 429 or status >= 500
+    if isinstance(exc, _TRANSIENT_NETWORK_ERRORS):
+        return True
+    if isinstance(exc, HttpError):
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status is None:
+            return True  # unknown — give it a chance
+        return status == 429 or status >= 500
+    return False
 
 
 def _http_error_summary(exc: HttpError) -> str:
@@ -136,11 +153,16 @@ class YouTubeScraper:
     COMMENT_WEIGHT = 5
 
     def __init__(self) -> None:
+        # Bound EVERY API request with an explicit socket timeout. Without it
+        # httplib2 hangs on a network blip until the OS TCP timeout (~1 min),
+        # which is what produced the "timed out" spam across all bloggers.
+        # (developerKey is still applied when a custom http is supplied.)
         self._yt = build(
             "youtube",
             "v3",
             developerKey=_settings.youtube_api_key,
             cache_discovery=False,
+            http=httplib2.Http(timeout=_settings.youtube_timeout_sec),
         )
         # Transcript client (proxy-aware). Built once and reused.
         self._tx = _build_transcript_api()
@@ -190,6 +212,20 @@ class YouTubeScraper:
             )
             return []
 
+        except _TRANSIENT_NETWORK_ERRORS as e:
+            # Retries already exhausted (see @retry on the fetch helpers). Treat a
+            # persistent network timeout like an API error: log once and return
+            # []. This stops a network blip from bubbling up to the scheduler and
+            # spamming the admin with a "timed out" alert per blogger.
+            logger.warning(
+                "youtube_network_error", channel=channel_id, error=str(e)[:120]
+            )
+            await db_manager.log_event(
+                "scrape_error", f"YouTube network timeout for {channel_id}",
+                severity="warning", details={"channel_id": channel_id}
+            )
+            return []
+
     def get_transcript(self, video_id: str) -> str:
         """
         Fetch video transcript (preferring English, then auto-generated),
@@ -232,7 +268,7 @@ class YouTubeScraper:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     @retry(
-        retry=retry_if_exception(_is_transient_http_error),
+        retry=retry_if_exception(_is_transient_error),
         wait=wait_exponential(multiplier=1, min=4, max=30),
         stop=stop_after_attempt(3),
     )
@@ -288,7 +324,7 @@ class YouTubeScraper:
         return out
 
     @retry(
-        retry=retry_if_exception(_is_transient_http_error),
+        retry=retry_if_exception(_is_transient_error),
         wait=wait_exponential(multiplier=1, min=4, max=30),
         stop=stop_after_attempt(3),
     )
